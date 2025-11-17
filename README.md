@@ -7,3 +7,6 @@ esp8266 - Nuke for strongest WiFi Network around
   - Start sending deauth packet to that MAC Address with strongest signal,
   - after 10 seconds it will stop, and start again scanning networks around,
   - then again pick strongest ... loop
+
+## Whitelist
+- add wifi SSIDs to whitelist if you dont want to send deauth packet to well known networks
