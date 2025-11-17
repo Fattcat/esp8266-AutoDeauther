@@ -12,11 +12,11 @@ extern "C" {
 #define WHITELIST_ENABLED 1
 
 const char* EXCLUDE_SSID[] = {
-  "TP-Link_3997",
-  //"TP-LINK_A2183C",
-  "RasPi-Fi",
-  "NUO_9E75",
-  "TP-Link_3997_Ext"
+  "SSID%1",
+  //"SSID2",
+  "SSID03",
+  "SomeOtherSSID",
+  "Test123"
   //"",  // Hidden networks -> EMPTY SSID
 };
 const int EXCLUDE_COUNT = sizeof(EXCLUDE_SSID) / sizeof(EXCLUDE_SSID[0]);
