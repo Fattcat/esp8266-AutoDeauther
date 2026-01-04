@@ -1,6 +1,9 @@
 # esp8266-AutoDeauther
 esp8266 - Nuke for strongest WiFi Network around
 
+<p align="center">
+  <img src="https://visitor-badge.laobi.icu/badge?page_id=Fattcat.esp8266-AutoDeauther" alt="Visitor Count">
+  
 - What it does ?
   - start scanning networks,
   - it Will pick strongest RSSI signal (from all networks),
